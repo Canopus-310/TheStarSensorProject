@@ -1,170 +1,129 @@
-import os
-import cv2
-import numpy as np
+import argparse, numpy as np, cv2, csv, os
 
-# Resolve project root relative to this file
-THIS_DIR = os.path.dirname(os.path.abspath(__file__))
-PROJECT_ROOT = os.path.dirname(os.path.dirname(THIS_DIR))
-RESULTS_DIR = os.path.join(PROJECT_ROOT, "results")
-
-
-def ensure_dir(path: str) -> None:
-    if path and not os.path.exists(path):
-        os.makedirs(path, exist_ok=True)
+def parse_args():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--input", "-i", required=True)
+    ap.add_argument("--out_dir", default="results")
+    ap.add_argument("--threshold", type=float, default=None)
+    ap.add_argument("--min_area", type=int, default=6)
+    ap.add_argument("--snr_thresh", type=float, default=1.5)
+    ap.add_argument("--centroid_win", type=int, default=7)
+    return ap.parse_args()
 
 
-def threshold_stars(
-    input_path: str = None,
-    output_thresh_path: str = None,
-    use_otsu: bool = False,
-    manual_T: int = 65,
-) -> np.ndarray:
+def centroid(img, pts, win):
     """
-    Load the synthetic sky image and apply a global threshold
-    to produce a binary mask of candidate stars.
+    Subpixel centroid using weighted mean inside a local window.
+    pts includes (x, y, area, peak)
     """
-    if input_path is None:
-        input_path = os.path.join(RESULTS_DIR, "synthetic_sky_01.png")
-    if output_thresh_path is None:
-        output_thresh_path = os.path.join(
-            RESULTS_DIR, f"synthetic_sky_01_thresh_T{manual_T}.png"
-        )
+    h, w = img.shape
+    out = []
+    r = win // 2
 
-    print("Using input path:", input_path)
-    img = cv2.imread(input_path, cv2.IMREAD_GRAYSCALE)
+    for (x, y, area, peak) in pts:
+        xi = int(round(x))
+        yi = int(round(y))
+
+        if xi < r or yi < r or xi + r >= w or yi + r >= h:
+            continue
+
+        patch = img[yi-r:yi+r+1, xi-r:xi+r+1].astype(float)
+
+        # Weighted centroid
+        Y, X = np.mgrid[0:patch.shape[0], 0:patch.shape[1]]
+        m00 = patch.sum()
+        if m00 <= 1e-9:
+            continue
+
+        cx = (patch * X).sum() / m00
+        cy = (patch * Y).sum() / m00
+
+        out.append((xi + (cx - r), yi + (cy - r), area, peak))
+
+    return out
+
+
+def main():
+    args = parse_args()
+
+    # Load image
+    img = cv2.imread(args.input, cv2.IMREAD_ANYDEPTH)
     if img is None:
-        raise FileNotFoundError(f"Could not load image at {input_path}")
+        raise RuntimeError(f"Failed to load image: {args.input}")
 
-    print(f"Image stats: min={img.min()}, max={img.max()}, mean={img.mean():.2f}")
+    img = img.astype(np.float32)
+    h, w = img.shape
 
-    # Debug: fraction of pixels above various thresholds
-    for T in [10, 20, 27, 40, 55, 60, 80, 100]:
-        frac = np.mean(img > T)
-        print(f"T={T:3d} -> {frac*100:6.2f}% pixels above threshold")
-
-    if use_otsu:
-        retval, thresh_img = cv2.threshold(
-            img, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU
-        )
-        print("Otsu chose threshold:", retval)
+    # -------------------------
+    # FIX 3: Adaptive threshold
+    # -------------------------
+    if args.threshold is None:
+        p20 = np.percentile(img, 20)           # low percentile background
+        sigma_est = max(1.0, p20 / 2.0)        # rough noise estimate
+        T = p20 + 4.0 * sigma_est              # safe threshold
+        print(f"[detector] Auto-threshold: {T:.2f} (p20={p20:.2f}, sigma≈{sigma_est:.2f})")
     else:
-        retval, thresh_img = cv2.threshold(
-            img, manual_T, 255, cv2.THRESH_BINARY
-        )
-        print("Manual threshold used:", manual_T)
+        T = args.threshold
+        print(f"[detector] Manual threshold: {T:.2f}")
 
-    ensure_dir(os.path.dirname(output_thresh_path))
-    cv2.imwrite(output_thresh_path, thresh_img)
-    print("Saved binary threshold image to:", output_thresh_path)
+    # Threshold → mask
+    _, mask = cv2.threshold(img, T, 1, cv2.THRESH_BINARY)
+    mask = mask.astype(np.uint8)
 
-    return thresh_img
+    # Connected components
+    nlab, lab = cv2.connectedComponents(mask)
 
+    raw_pts = []
+    for lab_id in range(1, nlab):
+        ys, xs = np.where(lab == lab_id)
+        area = len(xs)
+        if area < args.min_area:
+            continue
+        peak = img[ys, xs].max()
+        raw_pts.append((xs.mean(), ys.mean(), area, peak))
 
-def clean_binary_mask(
-    binary_img: np.ndarray,
-    min_area: int = 5,
-    output_path: str = None,
-) -> np.ndarray:
-    """
-    Remove small white blobs (noise specks) from a binary image
-    using connected components + area filtering.
-    """
-    if output_path is None:
-        output_path = os.path.join(RESULTS_DIR, "synthetic_sky_01_clean.png")
+    # -------------------------
+    # FIX 4: Correct SNR filter
+    # -------------------------
+    filtered = []
+    win = args.centroid_win
+    r = win // 2
 
-    # Ensure binary is 0/255 uint8
-    bin_img = (binary_img > 0).astype(np.uint8) * 255
+    # estimate *global* noise for SNR floor
+    p10 = np.percentile(img, 10)
+    noise_sigma = max(1.0, p10 / 2.0)
 
-    # connectivity=8 → diagonal pixels also considered connected
-    num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(
-        bin_img, connectivity=8
-    )
+    for (x, y, area, peak) in raw_pts:
+        xi = int(round(x))
+        yi = int(round(y))
 
-    # stats: [label, 5 stats] -> [x, y, width, height, area]
-    areas = stats[:, cv2.CC_STAT_AREA]
+        if xi < r or yi < r or xi + r >= w or yi + r >= h:
+            continue
 
-    # Create an empty mask
-    clean = np.zeros_like(bin_img)
+        patch = img[yi-r:yi+r+1, xi-r:xi+r+1]
+        local_bg = np.median(patch)
 
-    kept = 0
-    for label in range(1, num_labels):  # skip background (0)
-        if areas[label] >= min_area:
-            clean[labels == label] = 255
-            kept += 1
+        snr = (peak - local_bg) / (noise_sigma + 1e-6)
 
-    ensure_dir(os.path.dirname(output_path))
-    cv2.imwrite(output_path, clean)
-    print(f"Cleaned mask saved to: {output_path}")
-    print(f"Total labels: {num_labels}, kept (area >= {min_area}): {kept}")
+        if snr >= args.snr_thresh:
+            filtered.append((x, y, area, peak))
 
-    return clean
+    # Subpixel centroiding
+    det2 = centroid(img, filtered, args.centroid_win)
 
+    # Save results
+    os.makedirs(args.out_dir, exist_ok=True)
+    out_csv = os.path.join(args.out_dir, "detected_centroids.csv")
 
-def detect_centroids(
-    clean_binary_img: np.ndarray,
-    original_img_path: str = None,
-    overlay_output_path: str = None,
-    csv_output_path: str = None,
-) -> list[tuple[float, float]]:
-    """
-    From a cleaned binary image, find connected components and
-    return their centroids. Also optionally draw them on the
-    original image and save a CSV.
-    """
-    if original_img_path is None:
-        original_img_path = os.path.join(RESULTS_DIR, "synthetic_sky_01.png")
-    if overlay_output_path is None:
-        overlay_output_path = os.path.join(RESULTS_DIR, "synthetic_sky_01_detected.png")
-    if csv_output_path is None:
-        csv_output_path = os.path.join(RESULTS_DIR, "synthetic_sky_01_centroids.csv")
+    with open(out_csv, "w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow(["x", "y", "area", "peak"])
+        for (x, y, a, p) in det2:
+            w.writerow([f"{x:.3f}", f"{y:.3f}", a, p])
 
-    # Ensure 0/255 uint8 binary
-    bin_img = (clean_binary_img > 0).astype(np.uint8) * 255
-
-    num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(
-        bin_img, connectivity=8
-    )
-
-    # Label 0 = background, skip it
-    detected_centroids = []
-    for label in range(1, num_labels):
-        cx, cy = centroids[label]  # note: (x, y) = (column, row)
-        detected_centroids.append((float(cx), float(cy)))
-
-    print(f"Detected {len(detected_centroids)} centroids")
-
-    # Draw on original image for visualization
-    orig = cv2.imread(original_img_path, cv2.IMREAD_GRAYSCALE)
-    if orig is None:
-        raise FileNotFoundError(f"Could not load original image at {original_img_path}")
-
-    orig_color = cv2.cvtColor(orig, cv2.COLOR_GRAY2BGR)
-    for (cx, cy) in detected_centroids:
-        cv2.circle(orig_color, (int(round(cx)), int(round(cy))), 3, (0, 0, 255), 1)
-
-    ensure_dir(os.path.dirname(overlay_output_path))
-    cv2.imwrite(overlay_output_path, orig_color)
-    print(f"Saved centroid overlay image to: {overlay_output_path}")
-
-    # Save CSV
-    ensure_dir(os.path.dirname(csv_output_path))
-    with open(csv_output_path, "w") as f:
-        f.write("id,x,y\n")
-        for idx, (cx, cy) in enumerate(detected_centroids):
-            f.write(f"{idx},{cx:.3f},{cy:.3f}\n")
-
-    print(f"Saved centroids CSV to: {csv_output_path}")
-
-    return detected_centroids
+    print("Detections:", len(det2))
+    print("Wrote:", out_csv)
 
 
 if __name__ == "__main__":
-    # 1. Threshold
-    thresh = threshold_stars(use_otsu=False, manual_T=55)
-
-    # 2. Clean noise specks (you liked min_area=3, but 5 is also fine)
-    clean = clean_binary_mask(thresh, min_area=3)
-
-    # 3. Detect centroids and visualize
-    centroids = detect_centroids(clean)
-    print("Example centroid:", centroids[0] if centroids else "None")
+    main()

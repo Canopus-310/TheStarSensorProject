@@ -1,113 +1,110 @@
 # src/scripts/project_catalog_to_pixels_point_at_bright.py
-"""
-Project catalog unit vectors into pixel coords.
-This script automatically chooses a target direction by averaging the brightest K stars
-and rotates the catalog so the camera looks at that patch. This avoids the 'zero visible'
-problem when the camera initially faces an empty direction.
-"""
-import sys, pathlib, os, csv, math
-project_root = pathlib.Path(__file__).resolve().parents[2]
-sys.path.insert(0, str(project_root))
+# Deterministic projector with strict angular clipping + debug prints
+import csv, math, numpy as np, os, sys
 
-import numpy as np
-from src.utils.camera_model import make_cam_params, direction_to_pixel
+ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+INFILE  = os.path.join(ROOT, "data", "catalog_unit_vectors.csv")
+OUTFILE = os.path.join(ROOT, "results", "catalog_projected.csv")
 
-# ---------- user-tweakable parameters ----------
-CAM_WIDTH = 640
-CAM_HEIGHT = 480
-CAM_FOV_X = 30.0        # horizontal FOV in degrees (can increase if you want)
-BRIGHT_K = 200          # number of brightest stars to average for target direction
-INFILE = "data/catalog_unit_vectors.csv"
-OUTFILE = "results/catalog_projected.csv"
-# ------------------------------------------------
+# ---------- USER TUNE ----------
+WIDTH  = 640
+HEIGHT = 480
+FOV_X_DEG = 0.0001   # <-- set this to what you want (degrees)
+# -------------------------------
 
-os.makedirs("results", exist_ok=True)
-cam = make_cam_params(width=CAM_WIDTH, height=CAM_HEIGHT, fov_x=CAM_FOV_X)
+# Derived
+half_fov_deg = float(FOV_X_DEG) / 2.0
+half_fov_cos = math.cos(math.radians(half_fov_deg))
 
-# read catalog into memory (we need mag + x,y,z)
+print(f"[projector] WIDTH={WIDTH} HEIGHT={HEIGHT} FOV_X_DEG={FOV_X_DEG} half_fov_deg={half_fov_deg}")
+
+# Camera boresight (inertial)
+TARGET = np.array([1.0, 0.0, 0.0])
+cam_dir = TARGET / np.linalg.norm(TARGET)
+
+# Build right/up basis for camera (not strictly needed for angle test, but for projection)
+WORLD_UP = np.array([0.0, 0.0, 1.0])
+if abs(np.dot(cam_dir, WORLD_UP)) > 0.99:
+    WORLD_UP = np.array([0.0, 1.0, 0.0])
+right = np.cross(cam_dir, WORLD_UP)
+rn = np.linalg.norm(right)
+if rn < 1e-12: right = np.array([0.0, 1.0, 0.0])
+else: right = right / rn
+up = np.cross(right, cam_dir); up = up / np.linalg.norm(up)
+
+# pinhole intrinsics (square pixels)
+FOV_X = math.radians(FOV_X_DEG)
+fx = (WIDTH / 2.0) / math.tan(FOV_X / 2.0)
+fy = fx
+cx = WIDTH / 2.0
+cy = HEIGHT / 2.0
+
+def project_unit_vector(v_in):
+    z_cam = float(np.dot(v_in, cam_dir))
+    if z_cam <= 0.0:
+        return None
+    x_cam = float(np.dot(v_in, right))
+    y_cam = float(np.dot(v_in, up))
+    xn = x_cam / z_cam
+    yn = y_cam / z_cam
+    u = fx * xn + cx
+    v = -fy * yn + cy
+    if 0.0 <= u < WIDTH and 0.0 <= v < HEIGHT:
+        return (u, v)
+    return None
+
+# remove previous file to avoid confusion
+try:
+    if os.path.exists(OUTFILE):
+        os.remove(OUTFILE)
+except Exception:
+    pass
+
 rows = []
-with open(INFILE, newline='', encoding='utf-8') as f:
+skipped = 0
+ang_debug = []
+
+with open(INFILE, newline="", encoding="utf-8") as f:
     r = csv.DictReader(f)
-    for row in r:
+    for i, row in enumerate(r):
         try:
-            x = float(row['x']); y = float(row['y']); z = float(row['z'])
+            x = float(row["x"]); y = float(row["y"]); z = float(row["z"])
         except Exception:
             continue
-        mag = None
-        if row.get('mag') not in (None, ''):
-            try:
-                mag = float(row['mag'])
-            except:
-                mag = None
-        rows.append({'row': row, 'x': x, 'y': y, 'z': z, 'mag': mag})
+        v = np.array([x, y, z])
+        # exact angular separation (in degrees) between v and cam_dir
+        cosang = np.dot(v, cam_dir)
+        # numerical safety
+        cosang = max(-1.0, min(1.0, float(cosang)))
+        ang_deg = math.degrees(math.acos(cosang))
+        # store some debug samples (first few)
+        if len(ang_debug) < 6:
+            ang_debug.append((i, ang_deg, cosang))
+        # strict clipping
+        if ang_deg <= half_fov_deg:
+            proj = project_unit_vector(v)
+            if proj is None:
+                # rare: projected out of pixel bounds
+                skipped += 1
+                continue
+            u, v_pix = proj
+            rows.append([ row.get("id",""), row.get("ra_deg",""), row.get("dec_deg",""),
+                          row.get("mag","9.0"),
+                          f"{x:.12g}", f"{y:.12g}", f"{z:.12g}",
+                          f"{u:.3f}", f"{v_pix:.3f}" ])
+        else:
+            skipped += 1
 
-if len(rows) == 0:
-    print("No catalog rows found in", INFILE)
-    sys.exit(1)
-
-# pick brightest K (smallest mag). If many mag are missing, fallback to first N vectors.
-with_mag = [r for r in rows if r['mag'] is not None]
-if len(with_mag) >= 10:
-    with_mag.sort(key=lambda r: r['mag'])
-    pick = with_mag[:min(BRIGHT_K, len(with_mag))]
-else:
-    # fallback: take the first BRIGHT_K rows
-    pick = rows[:min(BRIGHT_K, len(rows))]
-
-# compute average vector direction (weighted equally)
-vecs = np.array([[p['x'], p['y'], p['z']] for p in pick], dtype=float)
-mean_vec = vecs.mean(axis=0)
-norm = np.linalg.norm(mean_vec)
-if norm < 1e-12:
-    print("Couldn't compute a stable target direction; aborting.")
-    sys.exit(1)
-target = mean_vec / norm
-print("Auto target direction (unit):", target.tolist())
-
-# rotation: map 'target' -> +Z (0,0,1)
-def rotation_matrix_from_vectors(a, b):
-    a = a / np.linalg.norm(a)
-    b = b / np.linalg.norm(b)
-    v = np.cross(a, b)
-    c = np.dot(a, b)
-    s = np.linalg.norm(v)
-    if s < 1e-12:
-        return np.eye(3)
-    K = np.array([[0, -v[2], v[1]],
-                  [v[2], 0, -v[0]],
-                  [-v[1], v[0], 0]])
-    R = np.eye(3) + K + K @ K * ((1 - c) / (s**2))
-    return R
-
-R = rotation_matrix_from_vectors(target, np.array([0.0, 0.0, 1.0]))
-
-# project all rows (rotate first)
-total = 0
-visible = 0
-sample = []
-with open(OUTFILE, "w", newline='', encoding='utf-8') as fout:
-    w = csv.writer(fout)
+# write out
+os.makedirs(os.path.dirname(OUTFILE), exist_ok=True)
+with open(OUTFILE, "w", newline="", encoding="utf-8") as f:
+    w = csv.writer(f)
     w.writerow(["id","ra_deg","dec_deg","mag","x","y","z","u","v"])
-    for entry in rows:
-        total += 1
-        vin = np.array([entry['x'], entry['y'], entry['z']], dtype=float)
-        vcam = R.dot(vin)   # inertial -> camera frame
-        vec = (float(vcam[0]), float(vcam[1]), float(vcam[2]))
-        pix = direction_to_pixel(vec, cam)
-        if pix is not None:
-            visible += 1
-            u, v = pix
-            r = entry['row']
-            w.writerow([r.get('id',''), r.get('ra_deg',''), r.get('dec_deg',''), r.get('mag',''),
-                        f"{entry['x']:.12g}", f"{entry['y']:.12g}", f"{entry['z']:.12g}", f"{u:.3f}", f"{v:.3f}"])
-            if len(sample) < 8:
-                sample.append((r.get('id',''), r.get('ra_deg',''), r.get('dec_deg',''), f"{u:.3f}", f"{v:.3f}"))
+    w.writerows(rows)
 
-print(f"Total catalog rows: {total}")
-print(f"Visible (in cam FOV): {visible}")
-print("Wrote:", OUTFILE)
-print("Camera params:", cam)
-if sample:
-    print("Sample projected rows (id, ra_deg, dec_deg, u, v):")
-    for s in sample:
-        print(" ", s)
+print(f"[projector] Projected rows: {len(rows)}")
+print(f"[projector] Skipped rows: {skipped}")
+print("[projector] Sample angular debug (index, deg, cos):")
+for t in ang_debug:
+    print("   ", t)
+print("[projector] Wrote:", OUTFILE)
