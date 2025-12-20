@@ -9,13 +9,13 @@ import csv
 from src.utils.camera_model import make_cam_params, direction_to_pixel
 import os
 
-os.makedirs("results", exist_ok=True)
+os.makedirs("../../results/results_archived_2", exist_ok=True)
 
 # camera params (change as you like)
 cam = make_cam_params(width=640, height=480, fov_x=30.0)
 
 inf = "C:/Users/aryan/PycharmProjects/TheStarSensorProject/data/catalog_unit_vectors.csv"
-out = "C:/Users/aryan/PycharmProjects/TheStarSensorProject/results/catalog_projected.csv"
+out = "C:/Users/aryan/PycharmProjects/TheStarSensorProject/results_archived_2/catalog_projected.csv"
 
 with open(inf, newline='', encoding='utf-8') as f_in, open(out, "w", newline='', encoding='utf-8') as f_out:
     r = csv.DictReader(f_in)

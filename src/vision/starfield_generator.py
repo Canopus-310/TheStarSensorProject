@@ -11,7 +11,7 @@ def generate_starfield(
     psf_sigma=1.6,        # controls blur size in pixels
     max_flux= 1.0,         # brightest star intensity (before blur)
     read_noise_std=0.01,  # Gaussian noise std (relative)
-    output_path="results/synthetic_sky_01.png"
+    output_path="results_archived_2/synthetic_sky_01.png"
 ):
     # 1. Make sure output directory exists
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
@@ -85,6 +85,6 @@ def generate_starfield(
 
 if __name__ == "__main__":
     info = generate_starfield()
-    print("Saved:", "results/synthetic_sky_01.png")
+    print("Saved:", "results_archived_2/synthetic_sky_01.png")
     print("Example true star position:", info["x_true"][0], info["y_true"][0])
 

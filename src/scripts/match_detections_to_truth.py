@@ -1,7 +1,7 @@
 # scripts/match_detections_to_truth.py
 """
 Usage:
-  python scripts/match_detections_to_truth.py --det results/detected_centroids.csv --truth results/catalog_sky_01_truth.csv --det_cols x y --truth_cols u v --out results/match_report.csv --thresh 6.0
+  python scripts/match_detections_to_truth.py --det results_archived_2/detected_centroids.csv --truth results_archived_2/catalog_sky_01_truth.csv --det_cols x y --truth_cols u v --out results_archived_2/match_report.csv --thresh 6.0
 
 Columns:
  - detector file should have two numeric columns for coordinates (defaults: x,y)
@@ -14,7 +14,7 @@ parser.add_argument("--det", required=True, help="detected centroids CSV")
 parser.add_argument("--truth", required=True, help="truth CSV")
 parser.add_argument("--det_cols", nargs=2, default=["x","y"], help="detected columns names")
 parser.add_argument("--truth_cols", nargs=2, default=["u","v"], help="truth columns names")
-parser.add_argument("--out", default="results/match_report.csv")
+parser.add_argument("--out", default="results_archived_2/match_report.csv")
 parser.add_argument("--thresh", type=float, default=6.0, help="max pixels to consider a match")
 args = parser.parse_args()
 
